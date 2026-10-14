@@ -7,17 +7,20 @@ Usage: python infer_ensemble.py path/to/rock_image.jpg
 """
 
 import sys
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageFont
-import os
 import timm
 from ultralytics import YOLO
 
 NUM_CLASSES = 47
-from pathlib import Path
+LOW_CONF_THRESHOLD = 50.0  # percent; below this the image shows a warning
+
 
 def find_models_dir():
     """Look for the .pth files next to this script (Models/ or Models/Models/),
@@ -28,8 +31,9 @@ def find_models_dir():
         if (c / "ResNet_18.pth").exists():
             return str(c)
     raise FileNotFoundError(
-        "ResNet_18.pth khuje pawa jay ni. Checked: " + ", ".join(str(c) for c in candidates)
+        "ResNet_18.pth not found. Checked: " + ", ".join(str(c) for c in candidates)
     )
+
 
 MODELS_DIR = find_models_dir()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -110,7 +114,7 @@ class MobileNetV4Classifier(nn.Module):
         x = self.base_model.conv_stem(x)
         x = self.base_model.bn1(x)
         x = self.base_model.blocks(x)
-        x = x.mean(dim=[2, 3])  # manual global average pool -> (B, 960), skips conv_head/norm_head
+        x = x.mean(dim=[2, 3])  # manual global average pool -> (B, 960)
         return self.classification_head(x)
 
 
@@ -155,22 +159,34 @@ MODEL_REGISTRY = {
 def load_model(cls, weight_file):
     model = cls()
     state_dict = torch.load(f"{MODELS_DIR}/{weight_file}", map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict, strict=False)
+    result = model.load_state_dict(state_dict, strict=False)
+    # MobileNetV4 conv_head/norm_head keys are expected to be "unexpected" (bypassed on purpose).
+    missing = list(result.missing_keys)
+    unexpected = [k for k in result.unexpected_keys
+                  if not (cls is MobileNetV4Classifier and ("conv_head" in k or "norm_head" in k))]
+    if missing or unexpected:
+        print(f"  [WARNING {weight_file}] missing: {missing[:5]}  unexpected: {unexpected[:5]}")
     model.to(DEVICE)
     model.eval()
     return model
 
 
 # ---------------------------------------------------------------------------
-# Class index -> rock name.
-# The checkpoints only store class INDICES (0-46), not names, so the names
-# must come from your original dataset/training label order.
-# Fill in as many as you know, in the form:   index: "Rock Name",
-# Any index left out is shown on the image as "Name not set".
+# Class index -> rock name (confirmed: 47 training folders in A-Z order).
 # ---------------------------------------------------------------------------
 CLASS_NAMES = {
-    # 0: "...",
-    # 1: "...",
+    0: "Amphibolite", 1: "Andesite", 2: "Anthracite", 3: "Basalt",
+    4: "Blueschist", 5: "Carbonate", 6: "Carbonatite", 7: "Chert",
+    8: "Coal", 9: "Coarse", 10: "Diamictite", 11: "Dolomite",
+    12: "Eclogite", 13: "Evaporite", 14: "Flint", 15: "Gabbro",
+    16: "Gneissic", 17: "Granite", 18: "Granulite", 19: "Greenschist",
+    20: "Greywacke", 21: "Hornfels", 22: "Komatiite", 23: "Marble",
+    24: "Mudstone_Shale", 25: "Obsidian", 26: "Oolite", 27: "Pegmatite",
+    28: "Phyllite", 29: "Porphyry", 30: "Pyroclastic", 31: "Pyroxenite",
+    32: "Quartz", 33: "Quartzite", 34: "Quartzolite", 35: "Rhyolite",
+    36: "Sandstone", 37: "Scoria", 38: "Serpentinite", 39: "Shale",
+    40: "Siltstone", 41: "Slate", 42: "Talc", 43: "Tephrite",
+    44: "Travertine", 45: "Turbidite", 46: "Wackestone",
 }
 
 
@@ -183,36 +199,48 @@ def get_font(size):
     return ImageFont.load_default()
 
 
-def annotate_image(img, class_idx, confidence):
-    """Write the predicted class + rock name in the top-right corner."""
+def annotate_image(img, top3):
+    """Write predicted class, rock name, confidence and runner-ups in the top-right corner.
+    top3 = [(class_idx, confidence_percent), ...]"""
     out = img.copy()
     draw = ImageDraw.Draw(out, "RGBA")
     W, H = out.size
 
+    class_idx, confidence = top3[0]
     rock_name = CLASS_NAMES.get(class_idx, "Name not set")
-    lines = [f"Class: {class_idx}", f"Rock: {rock_name}", f"Confidence: {confidence:.1f}%"]
+
+    # (text, color) pairs
+    lines = [
+        (f"Class: {class_idx}", (255, 255, 255, 255)),
+        (f"Rock: {rock_name}", (255, 255, 255, 255)),
+        (f"Confidence: {confidence:.1f}%", (255, 255, 255, 255)),
+    ]
+    if confidence < LOW_CONF_THRESHOLD:
+        lines.append(("LOW CONFIDENCE", (255, 90, 90, 255)))
+    for rank, (i, c) in enumerate(top3[1:], start=2):
+        lines.append((f"#{rank}: {CLASS_NAMES.get(i, 'Name not set')} ({c:.1f}%)", (220, 220, 220, 255)))
 
     pad = max(6, W // 60)
     font_size = max(14, W // 28)
     while True:  # shrink the font if the box would not fit inside the image
         font = get_font(font_size)
-        boxes = [draw.textbbox((0, 0), t, font=font) for t in lines]
+        boxes = [draw.textbbox((0, 0), t, font=font) for t, _ in lines]
         widths = [b[2] - b[0] for b in boxes]
         heights = [b[3] - b[1] for b in boxes]
+        gap = pad // 2
         box_w = max(widths) + 2 * pad
-        if box_w <= W - 2 * pad or font_size <= 10:
+        box_h = sum(heights) + gap * (len(lines) - 1) + 2 * pad
+        if (box_w <= W - 2 * pad and box_h <= H - 2 * pad) or font_size <= 10:
             break
         font_size -= 2
 
-    gap = pad // 2
-    box_h = sum(heights) + gap * (len(lines) - 1) + 2 * pad
     x1 = max(0, W - box_w - pad)
     y1 = pad
     draw.rectangle([x1, y1, x1 + box_w, y1 + box_h], fill=(0, 0, 0, 175))
 
     y = y1 + pad
-    for t, b, h in zip(lines, boxes, heights):
-        draw.text((x1 + pad, y - b[1]), t, font=font, fill=(255, 255, 255, 255))
+    for (t, color), b, h in zip(lines, boxes, heights):
+        draw.text((x1 + pad, y - b[1]), t, font=font, fill=color)
         y += h + gap
     return out
 
@@ -239,7 +267,7 @@ def main():
 
         top_idx = int(torch.argmax(probs))
         top_conf = float(probs[top_idx]) * 100
-        print(f"  {name:20s} -> class {top_idx:2d}  ({top_conf:.2f}%)")
+        print(f"  {name:20s} -> class {top_idx:2d} {CLASS_NAMES.get(top_idx, '?'):16s} ({top_conf:.2f}%)")
 
     # Ensemble: average softmax probabilities across all 5 models
     avg_probs = torch.stack(all_probs).mean(dim=0)
@@ -247,15 +275,19 @@ def main():
 
     print("\nEnsemble (averaged) top-5 prediction:")
     for rank, (idx, p) in enumerate(zip(top5_idx.tolist(), top5_prob.tolist()), start=1):
-        print(f"  {rank}. class {idx:2d}  —  {p*100:.2f}%")
+        print(f"  {rank}. class {idx:2d} {CLASS_NAMES.get(idx, '?'):16s} —  {p*100:.2f}%")
 
-    # Final prediction = ensemble top-1; write it onto a copy of the test image
+    # Final prediction = ensemble top-1; write top-3 onto a copy of the test image
     final_idx = int(top5_idx[0])
     final_conf = float(top5_prob[0]) * 100
     final_name = CLASS_NAMES.get(final_idx, "Name not set")
     print(f"\nFINAL: class {final_idx} | rock: {final_name} | confidence: {final_conf:.2f}%")
+    if final_conf < LOW_CONF_THRESHOLD:
+        print("NOTE: low confidence - the models disagree, treat this result with caution.")
 
-    annotated = annotate_image(img, final_idx, final_conf)
+    top3 = [(i, p * 100) for i, p in zip(top5_idx.tolist()[:3], top5_prob.tolist()[:3])]
+    annotated = annotate_image(img, top3)
+
     results_dir = Path(__file__).resolve().parent / "results"
     results_dir.mkdir(exist_ok=True)
     out_path = results_dir / f"{Path(image_path).stem}_result.jpg"
