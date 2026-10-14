@@ -1,0 +1,7 @@
+﻿*.zip
+*.pth
+results/
+__pycache__/
+*.jpg
+*.png
+*.webp
